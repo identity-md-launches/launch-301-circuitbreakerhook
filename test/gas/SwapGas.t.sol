@@ -7,6 +7,10 @@ abstract contract GasSwapRunner is GasFixture {
     function runMeasurement(bool withHook, bool buy, bool exactOut) external {
         measureSwap(withHook, buy, exactOut);
     }
+
+    function runTrippedMeasurement() external {
+        measureTrippedSwap();
+    }
 }
 
 contract GasSwapFirstEverTest is GasSwapRunner {
@@ -62,6 +66,10 @@ abstract contract GasSwapMatrix is GasSwapRunner {
 
     function test_gas_swap_noHook_sell_exactOut() public {
         this.runMeasurement(false, false, true);
+    }
+
+    function test_gas_swap_hook_buy_tripped() public {
+        this.runTrippedMeasurement();
     }
 }
 

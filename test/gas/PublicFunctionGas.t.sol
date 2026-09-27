@@ -11,7 +11,7 @@ import {IHooks} from "v4-core/src/interfaces/IHooks.sol";
 import {Hooks} from "v4-core/src/libraries/Hooks.sol";
 import {PoolKey} from "v4-core/src/types/PoolKey.sol";
 import {Currency} from "v4-core/src/types/Currency.sol";
-import {BalanceDelta} from "v4-core/src/types/BalanceDelta.sol";
+import {BalanceDelta, toBalanceDelta} from "v4-core/src/types/BalanceDelta.sol";
 import {BeforeSwapDelta} from "v4-core/src/types/BeforeSwapDelta.sol";
 import {ModifyLiquidityParams, SwapParams} from "v4-core/src/types/PoolOperation.sol";
 import {StateLibrary} from "v4-core/src/libraries/StateLibrary.sol";
@@ -264,16 +264,30 @@ contract GasHookFunctionsTest is GasHookViews {
         assertEq(hook.refSqrtPrice(hooked.toId()), price);
     }
 
+    /// @dev A real trade hands `afterSwap` a non-zero delta; the zero delta is the refused phantom path below.
     function test_gas_hook_afterSwap() public {
         bytes memory result = this.measureCall(
             "Hook.afterSwap.inBand",
             address(hook),
             abi.encodeCall(
-                hook.afterSwap, (address(router), hooked, SwapParams(true, -1, 1), BalanceDelta.wrap(0), bytes(""))
+                hook.afterSwap, (address(router), hooked, SwapParams(true, -1, 1), toBalanceDelta(-1, 1), bytes(""))
             ),
             address(manager)
         );
         assertEq(result, abi.encode(IHooks.afterSwap.selector, int128(0)));
+    }
+
+    function test_gas_hook_afterSwap_phantom() public {
+        uint160 ref = hook.refSqrtPrice(hooked.toId());
+        this.measureRevert(
+            "Hook.afterSwap.phantom",
+            address(hook),
+            abi.encodeCall(
+                hook.afterSwap, (address(router), hooked, SwapParams(true, -1, 1), BalanceDelta.wrap(0), bytes(""))
+            ),
+            address(manager),
+            abi.encodeWithSelector(CircuitBreakerHook.PhantomSwap.selector, ref, currentPrice())
+        );
     }
 
     function test_gas_hook_beforeSwap_nonNative() public {
@@ -321,6 +335,20 @@ contract GasHookFirstEverTest is GasFixture {
         assertEq(result, abi.encode(IHooks.beforeSwap.selector, BeforeSwapDelta.wrap(0), uint24(0)));
         assertEq(hook.refBlock(hooked.toId()), 100);
         assertEq(hook.refSqrtPrice(hooked.toId()), LaunchParams.initialSqrtPriceX96());
+    }
+
+    /// @dev Before any swap the stored reference is zero, so every price is outside the band: the cheapest
+    /// way to reach the `Tripped` revert path through the callback alone.
+    function test_gas_hook_afterSwap_tripped() public {
+        this.measureRevert(
+            "Hook.afterSwap.tripped",
+            address(hook),
+            abi.encodeCall(
+                hook.afterSwap, (address(router), hooked, SwapParams(true, -1, 1), toBalanceDelta(-1, 1), bytes(""))
+            ),
+            address(manager),
+            abi.encodeWithSelector(CircuitBreakerHook.Tripped.selector, uint160(0), LaunchParams.initialSqrtPriceX96())
+        );
     }
 }
 

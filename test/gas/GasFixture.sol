@@ -13,6 +13,7 @@ import {BalanceDelta} from "v4-core/src/types/BalanceDelta.sol";
 import {ModifyLiquidityParams, SwapParams} from "v4-core/src/types/PoolOperation.sol";
 import {PoolSwapTest} from "v4-core/src/test/PoolSwapTest.sol";
 import {PoolModifyLiquidityTest} from "v4-core/src/test/PoolModifyLiquidityTest.sol";
+import {CustomRevert} from "v4-core/src/libraries/CustomRevert.sol";
 import {CBRK} from "../../src/CBRK.sol";
 import {CircuitBreakerHook} from "../../src/CircuitBreakerHook.sol";
 import {HookFlags} from "../../src/HookFlags.sol";
@@ -164,5 +165,66 @@ abstract contract GasFixture is Test {
         assertTrue(ok, label);
         emit log_named_uint(label, used);
         return returned;
+    }
+
+    /// @dev Same measurement for a path that is expected to revert with exactly `expectedReason`.
+    function measureRevert(
+        string memory label,
+        address target,
+        bytes memory data,
+        address caller,
+        bytes memory expectedReason
+    ) external {
+        vm.cool(target);
+        vm.cool(address(manager));
+        vm.prank(caller);
+        (bool ok, bytes memory returned) = target.call(data);
+        uint256 used = vm.lastCallGas().gasTotalUsed;
+        assertFalse(ok, label);
+        assertEq(returned, expectedReason, label);
+        emit log_named_uint(label, used);
+    }
+
+    /// @dev The gas a swapper burns on a swap the hook refuses: the block's first buy, sized well past the
+    /// 10% band on the launch seed. Everything the PoolManager did is unwound, so the only thing that
+    /// survives is the gas bill. Cost is comparable to the passing swap because the revert happens at the
+    /// very end, after the full swap and the hook's `getSlot0` read.
+    function measureTrippedSwap() internal {
+        uint160 ref = hook.refSqrtPrice(hooked.toId());
+        uint256 oldBlock = hook.refBlock(hooked.toId());
+        (uint160 before,,,) = manager.getSlot0(hooked.toId());
+        uint256 ethIn = 20 ether;
+        bytes memory data = abi.encodeCall(
+            router.swap,
+            (
+                hooked,
+                SwapParams(true, -int256(ethIn), TickMath.MIN_SQRT_PRICE + 1),
+                PoolSwapTest.TestSettings(false, false),
+                ""
+            )
+        );
+        coolPool();
+        (bool ok, bytes memory reason) = address(router).call{value: ethIn}(data);
+        uint256 used = vm.lastCallGas().gasTotalUsed;
+        assertFalse(ok, "an oversized first buy must trip");
+        assertEq(bytes4(reason), CustomRevert.WrappedError.selector);
+        (address at, bytes4 selector, bytes memory inner,) =
+            abi.decode(slice(reason, 4), (address, bytes4, bytes, bytes));
+        assertEq(at, address(hook));
+        assertEq(selector, IHooks.afterSwap.selector);
+        assertEq(bytes4(inner), CircuitBreakerHook.Tripped.selector);
+        emit log_named_uint("tripped swap execution gas", used);
+        (uint160 afterPrice,,,) = manager.getSlot0(hooked.toId());
+        assertEq(afterPrice, before, "a tripped swap leaves the pool untouched");
+        assertEq(hook.refBlock(hooked.toId()), oldBlock, "a tripped swap leaves no reference");
+        assertEq(hook.refSqrtPrice(hooked.toId()), ref);
+        assertEq(address(router).balance, 0);
+    }
+
+    function slice(bytes memory data, uint256 start) internal pure returns (bytes memory out) {
+        out = new bytes(data.length - start);
+        for (uint256 i; i < out.length; ++i) {
+            out[i] = data[start + i];
+        }
     }
 }
