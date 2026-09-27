@@ -1,0 +1,26 @@
+{
+  "kind": "univ4_hook",
+  "hook": {
+    "contract": "CircuitBreakerHook",
+    "constructorArgs": [
+      "0xE03A1074c86CFeDd5C142C4F04F1a1536e203543"
+    ],
+    "permissions": [
+      "beforeSwap",
+      "afterSwap"
+    ]
+  },
+  "token": {
+    "contract": "CBRK",
+    "name": "Breaker",
+    "symbol": "CBRK",
+    "decimals": 18
+  },
+  "pool": {
+    "pairedCurrency": "0x0000000000000000000000000000000000000000",
+    "fee": 3000,
+    "tickSpacing": 60,
+    "initialPrice": "158570052814919122920977766972888"
+  },
+  "notes": "Sepolia native-ETH/CBRK pool: currency0 is native ETH, currency1 is CBRK. initialPrice is decimal sqrtPriceX96 from TickMath.getSqrtPriceAtTick(152040), matching test/utils/LaunchParams.sol and the one-sided CBRK launch rehearsal. The hook's sole constructor argument is the Sepolia PoolManager. Enabled permissions require low address bits 0x00C0; all other permissions, including return deltas, are false. The constructor validates those bits. Before the first swap of each block, the hook records the current price per PoolId and emits ReferenceSet. After every swap, including the first, it reverts with Tripped if the squared price is outside the reference's +/-10% band, using inward-rounded Q96 square-root constants and FullMath. Reverts leave no reference update or event; swap simulation is needed to detect trips. Initialization, liquidity changes and donations have no enabled callbacks. Pools whose currency0 is not native ETH receive zero deltas and no reference updates or band checks. All callbacks require the PoolManager. The hook charges no fee and has no fund custody or administrative controls. CBRK has a zero-argument constructor. Pushing price to a band edge can block further same-direction swaps for the rest of that block; moves back inside the band remain possible and the next block resets the reference. ABI exports are docs/abi/CircuitBreakerHook.json and docs/abi/CBRK.json. This manifest is a technical description; launch policy and signed artifact linkage are supplied separately by services."
+}
