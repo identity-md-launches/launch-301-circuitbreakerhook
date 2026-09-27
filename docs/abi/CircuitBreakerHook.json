@@ -462,7 +462,7 @@
         ]
       },
       {
-        "name": "",
+        "name": "delta",
         "type": "int256",
         "internalType": "BalanceDelta"
       },
@@ -1149,6 +1149,22 @@
     "type": "error",
     "name": "NotPoolManager",
     "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "PhantomSwap",
+    "inputs": [
+      {
+        "name": "refSqrtPriceX96",
+        "type": "uint160",
+        "internalType": "uint160"
+      },
+      {
+        "name": "newSqrtPriceX96",
+        "type": "uint160",
+        "internalType": "uint160"
+      }
+    ]
   },
   {
     "type": "error",

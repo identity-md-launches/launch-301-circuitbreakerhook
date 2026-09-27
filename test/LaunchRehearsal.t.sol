@@ -6,7 +6,7 @@ import {PoolManager} from "v4-core/src/PoolManager.sol";
 import {StateLibrary} from "v4-core/src/libraries/StateLibrary.sol";
 import {IPoolManager} from "v4-core/src/interfaces/IPoolManager.sol";
 import {BalanceDelta} from "v4-core/src/types/BalanceDelta.sol";
-import {SwapParams} from "v4-core/src/types/PoolOperation.sol";
+import {ModifyLiquidityParams, SwapParams} from "v4-core/src/types/PoolOperation.sol";
 import {PoolSwapTest} from "v4-core/src/test/PoolSwapTest.sol";
 
 import {CircuitBreakerHook} from "../src/CircuitBreakerHook.sol";
@@ -100,7 +100,8 @@ contract LaunchRehearsalTest is CircuitBreakerFixture {
 
     /// @dev A sell before any buy: there is no liquidity above the opening price, so the pool would slide
     /// to the price limit without trading. With a far limit that is a >10% move and the hook trips; with
-    /// a limit inside the band the swap settles at the limit with nothing exchanged.
+    /// a limit inside the band the slide exchanges nothing and is refused as a phantom swap, so the price
+    /// stays where it was and no reference is left behind.
     function test_rehearsal_sellIntoEthlessPool() public {
         initializePool();
         seedOneSided();
@@ -110,10 +111,165 @@ contract LaunchRehearsalTest is CircuitBreakerFixture {
         swap(key, false, -int256(1000 ether), far);
 
         uint160 nearLimit = sqrtPriceAtRatio(initialSqrtPrice, 10_500);
-        BalanceDelta d = swap(key, false, -int256(1000 ether), nearLimit);
-        assertEq(d.amount0(), 0, "ETH came out of an ETH-less pool");
-        assertEq(d.amount1(), 0, "CBRK was taken with nothing given back");
-        assertEq(currentSqrtPrice(), nearLimit);
+        expectPhantom(initialSqrtPrice, nearLimit);
+        swap(key, false, -int256(1000 ether), nearLimit);
+
+        assertEq(currentSqrtPrice(), initialSqrtPrice, "a refused slide moved the price");
+        assertEq(hook.refBlock(poolId), 0, "a refused slide left a reference");
+        assertEq(address(manager).balance, 0);
+    }
+
+    /// @dev A real sell after buys exist trades through the seed range and may run out of ETH at the
+    /// opening tick; the swap then slides on to its limit without exchanging more. Its delta is not zero,
+    /// so it is not a phantom swap; only the band judges it. The price it leaves above the seed is one a
+    /// real trade reached, and a small buy in the next block brings the pool back into the seeded range.
+    function test_rehearsal_sellThatDrainsTheEthAndSlidesOnIsATrade() public {
+        initializePool();
+        seedOneSided();
+        swapExactIn(true, SMALL_FIRST_BUY);
+        vm.roll(vm.getBlockNumber() + 1);
+
+        uint160 ref = currentSqrtPrice();
+        uint160 limit = sqrtPriceAtRatio(ref, 10_500); // inside the band, above the opening price
+        assertGt(limit, initialSqrtPrice);
+        BalanceDelta d = swap(key, false, -int256(100_000_000 ether), limit); // far more than the pool's ETH
+        // the buy's 0.30% fee stays with the seed position as ETH; everything else comes back out
+        assertGt(d.amount0(), int256(SMALL_FIRST_BUY * 99 / 100), "the sell did not take (almost) all the ETH");
+        assertLt(d.amount1(), 0, "the sell paid no CBRK");
+        assertEq(currentSqrtPrice(), limit, "the sell did not slide to its limit");
+        assertLt(address(manager).balance, SMALL_FIRST_BUY / 100, "ETH left after a full drain");
+
+        vm.roll(vm.getBlockNumber() + 1);
+        swapExactIn(true, 0.05 ether);
+        assertLt(currentSqrtPrice(), initialSqrtPrice, "the buy did not re-enter the seed");
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Reference ratchet through empty liquidity (review finding a8a8d7ba...)
+    // ---------------------------------------------------------------------------------------------
+
+    /// @dev The reported attack, verbatim: an account with no CBRK, no ETH and no approvals pushes the
+    /// price to the block's upper band edge with a oneForZero swap of 1 wei. Nothing above the opening
+    /// tick holds liquidity, so the pool would slide there exchanging nothing and the next block's
+    /// reference would be the pushed price. The hook now refuses the slide as a phantom swap, the price
+    /// and the reference are untouched, and buys in the next block are judged against the opening price.
+    function test_ratchet_freeEdgePushIsRefusedAndNextBlockBuysStillPass() public {
+        initializePool();
+        seedOneSided();
+
+        address attacker = makeAddr("attacker");
+        vm.deal(attacker, 1 ether); // gas money only; the swap sends none of it
+        (, uint256 upper) = hook.allowedBand(initialSqrtPrice);
+
+        vm.prank(attacker);
+        (bool ok, bytes memory reason) = address(swapRouter)
+            .call(
+                abi.encodeCall(
+                    PoolSwapTest.swap,
+                    (key, SwapParams(false, -1, uint160(upper)), PoolSwapTest.TestSettings(false, false), "")
+                )
+            );
+        assertFalse(ok, "a costless slide to the band edge went through");
+        (uint160 ref, uint160 pushed) = decodePhantom(reason);
+        assertEq(ref, initialSqrtPrice);
+        assertEq(pushed, uint160(upper));
+        assertEq(currentSqrtPrice(), initialSqrtPrice, "the refused push moved the price");
+        assertEq(hook.refBlock(poolId), 0, "the refused push left a reference");
+        assertEq(attacker.balance, 1 ether);
+        assertEq(cbrk.balanceOf(attacker), 0);
+
+        // the same push below the band edge, and a slide downward, are phantom too
+        vm.prank(attacker);
+        (ok, reason) = address(swapRouter)
+            .call(
+                abi.encodeCall(
+                    PoolSwapTest.swap,
+                    (
+                        key,
+                        SwapParams(false, -1, sqrtPriceAtRatio(initialSqrtPrice, 10_100)),
+                        PoolSwapTest.TestSettings(false, false),
+                        ""
+                    )
+                )
+            );
+        assertFalse(ok, "a smaller costless slide went through");
+        decodePhantom(reason);
+
+        // next block: buys of every size the band allows pass, judged against the opening price
+        vm.roll(vm.getBlockNumber() + 1);
+        vm.expectEmit(true, true, true, true, address(hook));
+        emit CircuitBreakerHook.ReferenceSet(poolId, vm.getBlockNumber(), initialSqrtPrice);
+        swapExactIn(true, 1);
+        swapExactIn(true, 0.001 ether);
+        BalanceDelta buy = swapExactIn(true, SMALL_FIRST_BUY);
+        assertGt(buy.amount1(), 0, "the buy received no CBRK");
+        assertEq(hook.refSqrtPrice(poolId), initialSqrtPrice);
+    }
+
+    /// @dev What the ratchet would do without the phantom-swap rule, kept as the reference for the
+    /// finding: simulate the pushed reference directly and show that from a reference 21% above the
+    /// opening price (two pushes) every buy trips, because a buy can never end above the opening price.
+    /// This is the arithmetic the rule prevents from becoming reachable for free.
+    function test_ratchet_aReferenceAboveTheSeedWouldLockEveryBuy() public view {
+        (, uint256 push1) = hook.allowedBand(initialSqrtPrice);
+        (, uint256 push2) = hook.allowedBand(uint160(push1));
+        // one push: a buy ending exactly at the opening price is still inside the band
+        assertTrue(hook.isWithinBand(uint160(push1), initialSqrtPrice));
+        // two pushes: the opening price itself is already below the lower edge, so no buy can pass
+        assertFalse(hook.isWithinBand(uint160(push2), initialSqrtPrice));
+        (uint256 lower2,) = hook.allowedBand(uint160(push2));
+        assertGt(lower2, initialSqrtPrice);
+    }
+
+    /// @dev The residual the phantom-swap rule does not close, recorded so it is visible rather than
+    /// discovered again: an attacker who first parks a dust ETH-only position above the opening tick
+    /// gives the empty range a sliver of liquidity, and a sell of dust CBRK through it is a real (tiny)
+    /// trade. Its delta is non-zero, so the band alone judges it and the reference can still be walked
+    /// upward for the cost of a few wei. README states the launch-owner decision this leaves open
+    /// (a two-sided seed, or accepting the exposure).
+    function test_ratchet_dustLiquidityVariantIsNotClosedByTheRule() public {
+        initializePool();
+        seedOneSided();
+
+        address attacker = makeAddr("attacker");
+        vm.deal(attacker, 1 ether);
+        cbrk.transfer(attacker, 1_000_000_000); // 1e-9 CBRK
+        vm.startPrank(attacker);
+        cbrk.approve(address(swapRouter), type(uint256).max);
+        BalanceDelta parked = lpRouter.modifyLiquidity{value: 1000}(
+            key,
+            ModifyLiquidityParams(
+                LaunchParams.INITIAL_TICK + LaunchParams.TICK_SPACING,
+                LaunchParams.INITIAL_TICK + LaunchParams.TICK_SPACING * 200,
+                1000,
+                bytes32(0)
+            ),
+            ""
+        );
+        assertGt(parked.amount0(), -100, "the dust position cost more than 100 wei of ETH");
+        assertEq(parked.amount1(), 0);
+
+        (, uint256 upper) = hook.allowedBand(initialSqrtPrice);
+        BalanceDelta push = swap(key, false, -int256(uint256(1_000_000_000)), uint160(upper));
+        vm.stopPrank();
+        assertEq(push.amount0(), 0, "the push took ETH out");
+        assertLt(push.amount1(), 0, "the push exchanged nothing; the rule should have caught it");
+        assertGt(push.amount1(), -1_000_000_000, "the push consumed the whole dust budget");
+        assertEq(currentSqrtPrice(), uint160(upper), "the push did not reach the edge");
+
+        // next block: the reference is the pushed price and a 1 ETH buy trips
+        vm.roll(vm.getBlockNumber() + 1);
+        try swapRouter.swap{value: SMALL_FIRST_BUY}(
+            key,
+            SwapParams(true, -int256(SMALL_FIRST_BUY), TickMath.MIN_SQRT_PRICE + 1),
+            PoolSwapTest.TestSettings(false, false),
+            ""
+        ) {
+            revert("the residual is closed; update README and this test");
+        } catch (bytes memory reason) {
+            (uint160 ref,) = decodeTripped(reason);
+            assertEq(ref, uint160(upper), "the pushed price became the reference");
+        }
     }
 
     /// @dev The buy after the first one, in the next block, is judged against the new opening price.

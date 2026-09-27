@@ -19,6 +19,12 @@ Per pool (keyed by `PoolId`) and per block:
 2. **`afterSwap`** reads the post-swap `sqrtPriceX96` and reverts with `Tripped(refSqrtPriceX96, newSqrtPriceX96)`
    unless `ref * sqrt(0.9) <= new <= ref * sqrt(1.1)`, which is the spot price (sqrt price squared) within
    -10% / +10% of the reference.
+3. **`afterSwap`** then reverts with `PhantomSwap(refSqrtPriceX96, newSqrtPriceX96)` when the swap delta the
+   PoolManager hands it is zero in both currencies. The PoolManager rejects a zero `amountSpecified` and a
+   price limit at the current price, so a zero delta means the swap only slid the price through ticks that
+   hold no liquidity. That is not a trade, and it may not become the next block's reference (see
+   "Reference ratchet through empty liquidity" below). The band is checked first, so a phantom move that
+   also leaves the band reports `Tripped`.
 
 The band is computed with `FullMath.mulDiv` against two Q64.96 constants:
 
@@ -37,7 +43,10 @@ Consequences worth knowing:
 - **A single swap can trip.** The reference is taken before the block's first swap, so one trade that
   would move the price more than 10% reverts. Large trades have to be split across blocks.
 - **Tripped swaps leave nothing behind.** The revert unwinds the reference write and the event; the site
-  simulates instead of listing tripped swaps.
+  simulates instead of listing tripped swaps. The same holds for refused phantom swaps.
+- **A swap has to exchange something.** A swap whose delta is zero in both currencies is refused. No
+  ordinary trade is affected: exact-in always consumes its input, exact-out always delivers its output, and
+  a real trade that runs out of liquidity and slides on to its limit still has a non-zero delta.
 - **Liquidity changes and donations are never checked.** They do not move the price and the hook has no
   liquidity or donate permissions, so nothing in the hook can revert the factory's initialize or seed.
 - **Non-ETH pools are ignored.** A pool on this hook whose `currency0` is not native ETH gets zero deltas
@@ -65,9 +74,10 @@ amount and holds no funds.
 
 **Decoding a trip from a simulation.** The PoolManager wraps hook reverts, so an `eth_call` of a tripping
 swap returns `CustomRevert.WrappedError(address hook, bytes4 0xb47b2fb1 /* afterSwap */, bytes reason,
-bytes details)` where `reason` is `Tripped(uint160 ref, uint160 new)` (selector `0xf5207678`) and
-`details` is `HookCallFailed()` (`0xa9e35b2f`). The tests' `decodeTripped` helper in
-`test/utils/CircuitBreakerFixture.sol` shows the exact decoding.
+bytes details)` where `reason` is `Tripped(uint160 ref, uint160 new)` (selector `0xf5207678`) or
+`PhantomSwap(uint160 ref, uint160 new)` (selector `0x9ac63f26`) and `details` is `HookCallFailed()`
+(`0xa9e35b2f`). The tests' `decodeTripped` and `decodePhantom` helpers in
+`test/utils/CircuitBreakerFixture.sol` show the exact decoding.
 
 ## Deployment parameters
 
@@ -76,7 +86,7 @@ bytes details)` where `reason` is `Tripped(uint160 ref, uint160 new)` (selector 
 | Chain | Sepolia, 11155111 | manifest |
 | PoolManager (hook constructor argument, the only one) | `0xE03A1074c86CFeDd5C142C4F04F1a1536e203543` | `script/Deploy.s.sol`, manifest |
 | Hook flags / address suffix | `0x00C0` (`beforeSwap`, `afterSwap`) | `HookFlags`, `CircuitBreakerHook.HOOK_FLAGS()` |
-| Hook creation code | `type(CircuitBreakerHook).creationCode ++ abi.encode(poolManager)`, 6,048 bytes with the Sepolia PoolManager | `Deploy.hookCreationCode()` |
+| Hook creation code | `type(CircuitBreakerHook).creationCode ++ abi.encode(poolManager)`, 6,126 bytes with the Sepolia PoolManager | `Deploy.hookCreationCode()` |
 | Token | `CBRK`, zero-argument constructor, 1e27 base units minted to `msg.sender` | `src/CBRK.sol` |
 | Pool key | `currency0` = native ETH (address zero), `currency1` = CBRK, fee 3000, tickSpacing 60, hooks = the hook | factory; mirrored in `test/utils/LaunchParams.sol` |
 | Band | 10% either side of the block's opening price; source constants, not configurable | `CircuitBreakerHook` |
@@ -84,7 +94,7 @@ bytes details)` where `reason` is `Tripped(uint160 ref, uint160 new)` (selector 
 The CREATE2 salt is a pure function of the creation code and the deploying address. `Deploy.mineHookSalt`
 recomputes it for any deployer; `test_sepoliaSaltIsDeterministic` shows two runs agree. Through Foundry's
 deterministic deployer (`0x4e59b44847b379578588920cA78FbF26c0B4956C`) the current bytecode lands at
-`0x11Dd314E859Ff3925BE83eC5d6f2634D19D4C0C0` with salt 3177. The factory deploys from its own address and
+`0xb7E7CaD69B7F227e4Deda87a791f9f3D02f240c0` with salt 1643. The factory deploys from its own address and
 therefore mines its own salt; the flags and creation code are what it must match, not that address.
 
 ### Assumptions the rehearsal makes about the factory
@@ -102,8 +112,39 @@ to the manifest, not something the contracts know:
 With that seed, the first buy of 1 ETH moves the opening price by about 1.5% and passes; anything above
 roughly 7.5 ETH in one swap trips. If the factory opens at a different price or seeds differently, only
 the "small" and "oversized" buy sizes shift; the hook behaves the same. The rehearsal also shows that a
-sell before any buy into the ETH-less pool either trips (far price limit) or settles at its limit with
-nothing exchanged (limit inside the band), because there is no liquidity above the opening price.
+sell before any buy into the ETH-less pool either trips (far price limit) or is refused as a phantom swap
+(limit inside the band), because there is no liquidity above the opening price and the slide would
+exchange nothing. A sell after buys exist that drains the pool's ETH and slides on is a real trade and only
+the band judges it.
+
+### Reference ratchet through empty liquidity
+
+The independent review found that the accepted design, combined with the one-sided seed, let anyone move
+the next block's reference for gas alone. Nothing above the opening tick holds liquidity, so a
+`oneForZero` swap of 1 wei with its price limit at the block's upper band edge slid the price to that edge
+while exchanging nothing (delta `(0, 0)`, no CBRK, no ETH, no approval), and passed `afterSwap` because
+the end price was exactly the inclusive edge. The next block's reference was then the pushed price; a
+second push put it 21% above the opening price, and from there every buy tripped, because a buy has to
+travel back down to the opening price before it reaches liquidity and can never end above it. Walking the
+price back down was equally free but capped at -10% per block, and the attacker could re-push in the
+same block, so whoever was last in a block set the next reference.
+
+**What changed.** `afterSwap` now refuses a swap whose delta is zero in both currencies (`PhantomSwap`).
+The exact reported sequence reverts, leaves no state and no reference, and buys in the following block are
+judged against the opening price (`test_ratchet_freeEdgePushIsRefusedAndNextBlockBuysStillPass`). The rule
+costs no legitimate trader anything: a swap that exchanges nothing has no economic purpose.
+
+**What it does not close, and the decision it leaves open.** The rule raises the attacker's cost from
+zero to a few wei, not to a real trade. An attacker can first park a dust ETH-only position just above the
+opening tick (tens of wei of ETH), then sell dust CBRK through it. That swap has a non-zero delta, so only
+the band judges it, and the reference can still be walked upward by 10% per block
+(`test_ratchet_dustLiquidityVariantIsNotClosedByTheRule` records this). Closing it needs a change the
+approved workflow does not give this hook: either the factory seeds two-sided liquidity around the
+opening price, so that pushing the price up means buying into real depth and paying real slippage (the
+documented, accepted one-block griefing), or the reference is redefined as something other than the raw
+pre-block `slot0` price. Both are launch-owner decisions; this repository documents the exposure and
+leaves the approved reference definition and seed shape alone. Until one is taken, the launch pool is
+exposed to a cheap buy-side lock-out that a defender can only undo by being the last swap in a block.
 
 ## Operational responsibilities
 
@@ -112,11 +153,19 @@ nothing exchanged (limit inside the band), because there is no liquidity above t
   new pool.
 - **Traders split large orders across blocks.** The site's pre-check simulates a typed swap and says
   whether it would trip; routers that do not simulate will see reverts.
-- **Griefing is possible and accepted.** Anyone can push the price to the band edge early in a block and
-  block every further move in that direction until the next block (`test_griefing_edgePushBlocksSameDirectionForTheBlock`).
-  Moves back toward the reference stay open, the attacker pays fees and slippage to hold the edge, and
-  the next block starts from wherever the price ended. This is inherent to a per-block band and is not
-  mitigated here.
+- **One-block edge griefing with live liquidity is possible and accepted.** With two-sided liquidity
+  around the price, whoever is first in a block can swap the price to just inside a band edge; every later
+  swap in that block that would move further in that direction reverts in `afterSwap`, so victims pay gas
+  and get no fill (`test_griefing_edgePushBlocksSameDirectionForTheBlock`). Call sequence: block N, tx 1,
+  attacker swaps `zeroForOne` with a huge exact-in amount and `sqrtPriceLimitX96` at -9.5% from the
+  reference; tx 2, a victim's ordinary buy reverts with `Tripped`; tx 3, a sell (back toward the
+  reference) passes; block N+1 re-anchors at the pushed price and the victim's buy passes. Holding the
+  edge costs the attacker the 0.30% fee plus the slippage of a real trade of roughly 9.5% of pool depth,
+  recoverable only by trading back. This is inherent to a per-block band and is not mitigated here.
+- **The costless variant on an empty range is refused, the dust variant is not.** See "Reference ratchet
+  through empty liquidity" above: on the one-sided launch pool the phantom-swap rule stops the free push,
+  but a push through dust liquidity still costs only wei. The launch owners need to decide between a
+  two-sided seed and accepting that exposure before launch.
 - **Same-block reference is per pool.** A second ETH pool on the same hook (different fee or spacing)
   gets its own reference and budget.
 - **hookData is unused.** The hook reads no swapper identity and credits nobody; hookData is
@@ -157,7 +206,7 @@ order and in parallel.
 
 | File | Covers |
 | --- | --- |
-| `test/LaunchRehearsal.t.sol` | Factory-style initialize at the manifest price, one-sided CBRK seed (zero ETH taken), the first buy into the ETH-less pool passing and emitting `ReferenceSet`, an oversized first buy tripping and leaving no state, the same amount succeeding when split across blocks, a sell into the ETH-less pool, the next block's reference, fuzzed first-buy sizes |
+| `test/LaunchRehearsal.t.sol` | Factory-style initialize at the manifest price, one-sided CBRK seed (zero ETH taken), the first buy into the ETH-less pool passing and emitting `ReferenceSet`, an oversized first buy tripping and leaving no state, the same amount succeeding when split across blocks, a sell into the ETH-less pool (trips or is refused as phantom), a real sell that drains the ETH and slides on, the next block's reference, fuzzed first-buy sizes, the reference ratchet: the free edge push is refused and next-block buys pass, the arithmetic of a pushed reference, and the dust-liquidity residual |
 | `test/CircuitBreakerHook.t.sol` | Permissions exactly `beforeSwap`/`afterSwap` and the address bits, constructor rejecting a wrong address, inward-rounded constants, band fuzzing (contains reference, never exceeds 10%, never overflows), all ten callbacks refusing non-PoolManager callers, disabled callbacks refusing even the PoolManager, reference capture and once-per-block emission, exact-in and exact-out both ways, dust, 9.9% passing and 10.1% tripping both ways, inclusive band edges, two same-block swaps whose sum passes 10% (second trips), swap back inside the band, new block reset, griefing, liquidity/donate never checked, non-ETH pool ignored, per-`PoolId` state, views, fuzzed buys/sells/exact-out with truthful `Tripped` reasons |
 | `test/CBRK.t.sol` | Metadata, single mint to the deployer from bare creation code, exact transfers, allowance, reverts, no admin selector changes supply, fuzzed conservation |
 | `test/HookFlags.t.sol` | Constants mirror v4-core, matching, packing permissions, deterministic mining for any deployer, budget exhaustion |

@@ -10,7 +10,7 @@ import {StateLibrary} from "v4-core/src/libraries/StateLibrary.sol";
 import {PoolKey} from "v4-core/src/types/PoolKey.sol";
 import {PoolId} from "v4-core/src/types/PoolId.sol";
 import {Currency} from "v4-core/src/types/Currency.sol";
-import {BalanceDelta} from "v4-core/src/types/BalanceDelta.sol";
+import {BalanceDelta, BalanceDeltaLibrary} from "v4-core/src/types/BalanceDelta.sol";
 import {BeforeSwapDelta, BeforeSwapDeltaLibrary} from "v4-core/src/types/BeforeSwapDelta.sol";
 import {ModifyLiquidityParams, SwapParams} from "v4-core/src/types/PoolOperation.sol";
 
@@ -24,6 +24,10 @@ import {ModifyLiquidityParams, SwapParams} from "v4-core/src/types/PoolOperation
 ///  - `afterSwap` reads the post-swap `sqrtPriceX96` and reverts with {Tripped} unless
 ///    `ref * sqrt(0.9) <= new <= ref * sqrt(1.1)`, i.e. the spot price (sqrtPrice squared) is within
 ///    -10% / +10% of the reference. The bounds are rounded inward, so the band never exceeds 10%.
+///  - `afterSwap` also reverts with {PhantomSwap} when the swap exchanged nothing at all (a zero swap
+///    delta in both currencies). Such a swap only slid the price through ticks that hold no liquidity; it
+///    is not a trade, and letting it through would let anyone move the next block's reference for gas
+///    alone (see README, "Reference ratchet through empty liquidity").
 ///
 /// A tripped swap reverts the whole transaction, so it leaves no state and no event. The check also covers
 /// a block's first swap: a single trade that would move the price more than 10% cannot execute at all and
@@ -69,6 +73,12 @@ contract CircuitBreakerHook is IHooks {
     /// @dev Surfaces from the PoolManager wrapped as `CustomRevert.WrappedError(hook, afterSwap.selector,
     /// abi.encodeWithSelector(Tripped.selector, ref, new), abi.encodeWithSelector(HookCallFailed.selector))`.
     error Tripped(uint160 refSqrtPriceX96, uint160 newSqrtPriceX96);
+
+    /// @notice The swap moved the price while exchanging nothing in either currency: it only crossed ticks
+    /// with no liquidity. Refused so that a costless slide cannot become the next block's reference.
+    /// @dev Surfaces from the PoolManager wrapped exactly like {Tripped}, with this error as the reason.
+    /// Checked after the band, so a phantom move that also leaves the band reports {Tripped}.
+    error PhantomSwap(uint160 refSqrtPriceX96, uint160 newSqrtPriceX96);
 
     /// @notice A callback was invoked by something other than the PoolManager.
     error NotPoolManager();
@@ -141,9 +151,11 @@ contract CircuitBreakerHook is IHooks {
     }
 
     /// @inheritdoc IHooks
-    /// @dev Reads the post-swap price and reverts with {Tripped} when it is outside the band. Returns a
-    /// zero unspecified-currency delta in every path.
-    function afterSwap(address, PoolKey calldata key, SwapParams calldata, BalanceDelta, bytes calldata)
+    /// @dev Reads the post-swap price and reverts with {Tripped} when it is outside the band, then with
+    /// {PhantomSwap} when the pool's swap delta is zero in both currencies (the price moved through empty
+    /// liquidity only; the PoolManager rejects a zero `amountSpecified` and a limit at the current price,
+    /// so a zero delta always means such a slide). Returns a zero unspecified-currency delta in every path.
+    function afterSwap(address, PoolKey calldata key, SwapParams calldata, BalanceDelta delta, bytes calldata)
         external
         view
         override
@@ -155,6 +167,7 @@ contract CircuitBreakerHook is IHooks {
             (uint160 newSqrtPriceX96,,,) = POOL_MANAGER.getSlot0(poolId);
             uint160 ref = refSqrtPrice[poolId];
             if (!isWithinBand(ref, newSqrtPriceX96)) revert Tripped(ref, newSqrtPriceX96);
+            if (delta == BalanceDeltaLibrary.ZERO_DELTA) revert PhantomSwap(ref, newSqrtPriceX96);
         }
         return (IHooks.afterSwap.selector, 0);
     }

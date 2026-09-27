@@ -216,11 +216,24 @@ abstract contract CircuitBreakerFixture is Test {
 
     /// @dev The exact bytes the PoolManager surfaces when `afterSwap` reverts with `Tripped`.
     function trippedRevert(uint160 ref, uint160 newSqrtPrice) internal view returns (bytes memory) {
+        return afterSwapRevert(CircuitBreakerHook.Tripped.selector, ref, newSqrtPrice);
+    }
+
+    /// @dev The exact bytes the PoolManager surfaces when `afterSwap` reverts with `PhantomSwap`.
+    function phantomRevert(uint160 ref, uint160 newSqrtPrice) internal view returns (bytes memory) {
+        return afterSwapRevert(CircuitBreakerHook.PhantomSwap.selector, ref, newSqrtPrice);
+    }
+
+    function afterSwapRevert(bytes4 errorSelector, uint160 ref, uint160 newSqrtPrice)
+        internal
+        view
+        returns (bytes memory)
+    {
         return abi.encodeWithSelector(
             CustomRevert.WrappedError.selector,
             address(hook),
             IHooks.afterSwap.selector,
-            abi.encodeWithSelector(CircuitBreakerHook.Tripped.selector, ref, newSqrtPrice),
+            abi.encodeWithSelector(errorSelector, ref, newSqrtPrice),
             abi.encodeWithSelector(Hooks.HookCallFailed.selector)
         );
     }
@@ -229,15 +242,32 @@ abstract contract CircuitBreakerFixture is Test {
         vm.expectRevert(trippedRevert(ref, newSqrtPrice));
     }
 
+    function expectPhantom(uint160 ref, uint160 newSqrtPrice) internal {
+        vm.expectRevert(phantomRevert(ref, newSqrtPrice));
+    }
+
     /// @dev Decodes a caught revert and asserts it is a `Tripped` from this hook. Returns its arguments.
     function decodeTripped(bytes memory reason) internal view returns (uint160 ref, uint160 newSqrtPrice) {
+        return decodeAfterSwapError(reason, CircuitBreakerHook.Tripped.selector);
+    }
+
+    /// @dev Decodes a caught revert and asserts it is a `PhantomSwap` from this hook. Returns its arguments.
+    function decodePhantom(bytes memory reason) internal view returns (uint160 ref, uint160 newSqrtPrice) {
+        return decodeAfterSwapError(reason, CircuitBreakerHook.PhantomSwap.selector);
+    }
+
+    function decodeAfterSwapError(bytes memory reason, bytes4 errorSelector)
+        internal
+        view
+        returns (uint160 ref, uint160 newSqrtPrice)
+    {
         assertEq(bytes4(reason), CustomRevert.WrappedError.selector, "not a wrapped hook error");
         (address target, bytes4 selector, bytes memory inner, bytes memory details) =
             abi.decode(slice4(reason), (address, bytes4, bytes, bytes));
         assertEq(target, address(hook), "wrapped error is not from the hook");
         assertEq(selector, IHooks.afterSwap.selector, "wrapped error is not from afterSwap");
         assertEq(details, abi.encodeWithSelector(Hooks.HookCallFailed.selector), "unexpected details");
-        assertEq(bytes4(inner), CircuitBreakerHook.Tripped.selector, "inner error is not Tripped");
+        assertEq(bytes4(inner), errorSelector, "inner error is not the expected one");
         (ref, newSqrtPrice) = abi.decode(slice4(inner), (uint160, uint160));
     }
 
